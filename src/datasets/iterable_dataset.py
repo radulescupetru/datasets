@@ -675,10 +675,12 @@ class CyclingMultiSourcesExamplesIterable(_BaseExamplesIterable):
         self,
         ex_iterables: list[_BaseExamplesIterable],
         stopping_strategy: Literal["first_exhausted", "all_exhausted"] = "first_exhausted",
+        sample_with_replacement: bool = True,
     ):
         super().__init__()
         self.ex_iterables = ex_iterables
         self.stopping_strategy = stopping_strategy
+        self.sample_with_replacement = sample_with_replacement
 
         # if undersampling ("first_exhausted"), we stop as soon as one dataset is exhausted
         # if oversampling ("all_exhausted"), we stop as soons as every dataset is exhausted, i.e as soon as every samples of every dataset has been visited at least once
@@ -711,6 +713,52 @@ class CyclingMultiSourcesExamplesIterable(_BaseExamplesIterable):
             "type": self.__class__.__name__,
         }
         return self._state_dict
+
+    def _iter_arrow(self):
+        # we use this to buffer one example of each iterator to know if an iterator is exhausted
+        nexts = [None] * len(self.ex_iterables)
+        # because of that, we need to rewind 1 example when reloading the state dict
+        if self._state_dict:
+            for i in range(len(self.ex_iterables)):
+                if self._state_dict["previous_states"][i] is not None:
+                    self.ex_iterables[i].load_state_dict(self._state_dict["previous_states"][i])
+        iterators = [ex_iterable._iter_arrow() for ex_iterable in self.ex_iterables]
+
+        indices_iterator = self._get_indices_iterator()
+
+        is_exhausted = (
+            np.array(self._state_dict["is_exhausted"]) if self._state_dict else np.full(len(self.ex_iterables), False)
+        )
+        for i in indices_iterator:
+            # if the stopping criteria is met, break the main for loop
+            if self.bool_strategy_func(is_exhausted):
+                break
+            # Skip exhausted iterators
+            if is_exhausted[i] and not self.sample_with_replacement:
+                continue
+            # let's pick one example from the iterator at index i
+            if nexts[i] is None:
+                nexts[i] = next(iterators[i], False)
+            result = nexts[i]
+            if self._state_dict:
+                self._state_dict["previous_states"][i] = deepcopy(self._state_dict["ex_iterables"][i])
+            nexts[i] = next(iterators[i], False)
+
+            # the iterator is exhausted
+            if nexts[i] is False:
+                is_exhausted[i] = True
+                if self._state_dict:
+                    self._state_dict["is_exhausted"][i] = True
+                # we reset it in case the stopping crtieria isn't met yet
+                if self.sample_with_replacement:
+                    nexts[i] = None
+                    if self._state_dict:
+                        self._state_dict["ex_iterables"][i] = self.ex_iterables[i]._init_state_dict()
+                        self._state_dict["previous_states"][i] = None
+                    iterators[i] = self.ex_iterables[i]._iter_arrow()
+
+            if result is not False:
+                yield result
 
     def __iter__(self):
         # we use this to buffer one example of each iterator to know if an iterator is exhausted
@@ -943,8 +991,9 @@ class RandomlyCyclingMultiSourcesExamplesIterable(CyclingMultiSourcesExamplesIte
         generator: np.random.Generator,
         probabilities: Optional[list[float]] = None,
         stopping_strategy: Literal["first_exhausted", "all_exhausted"] = "first_exhausted",
+        sample_with_replacement: bool = True,
     ):
-        super().__init__(ex_iterables, stopping_strategy)
+        super().__init__(ex_iterables, stopping_strategy, sample_with_replacement)
         self.generator = deepcopy(generator)
         self.probabilities = probabilities
         # TODO(QL): implement iter_arrow
@@ -4421,6 +4470,7 @@ def _interleave_iterable_datasets(
     info: Optional[DatasetInfo] = None,
     split: Optional[NamedSplit] = None,
     stopping_strategy: Literal["first_exhausted", "all_exhausted"] = "first_exhausted",
+    sample_with_replacement: bool = True,
 ) -> IterableDataset:
     """
     Interleave several iterable datasets (sources) into a single iterable dataset.
@@ -4461,11 +4511,17 @@ def _interleave_iterable_datasets(
 
     # Use cycling or random cycling of sources
     if probabilities is None:
-        ex_iterable = CyclingMultiSourcesExamplesIterable(ex_iterables, stopping_strategy=stopping_strategy)
+        ex_iterable = CyclingMultiSourcesExamplesIterable(
+            ex_iterables, stopping_strategy=stopping_strategy, sample_with_replacement=sample_with_replacement
+        )
     else:
         generator = np.random.default_rng(seed)
         ex_iterable = RandomlyCyclingMultiSourcesExamplesIterable(
-            ex_iterables, generator=generator, probabilities=probabilities, stopping_strategy=stopping_strategy
+            ex_iterables,
+            generator=generator,
+            probabilities=probabilities,
+            stopping_strategy=stopping_strategy,
+            sample_with_replacement=sample_with_replacement,
         )
     # Set new info - we update the features
     # setting the features also ensures to fill missing columns with None
